@@ -161,12 +161,6 @@ sed -i "s/hostname='.*'/hostname='JDAX1800'/g" package/base-files/files/bin/conf
 sed -i "s/timezone='UTC'/timezone='CST-8'/g" package/base-files/files/bin/config_generate
 sed -i "s/zonename='UTC'/zonename='Asia\/Shanghai'/g" package/base-files/files/bin/config_generate
 
-# 修改默认 WiFi 名称和密码
-sed -i 's/OpenWrt/JDAX1800/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
-sed -i 's/OpenWrt/JDAX1800-5G/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
-sed -i 's/encryption=none/encryption=psk2/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
-sed -i 's/key=.*/key=huahua123/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
-
 # 修改 LuCI 版本显示（保留原作者逻辑）
 luci_system_js="feeds/luci/modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js"
 firmware_version_anchor="_('Firmware Version'), (L.isObject(boardinfo.release) ? boardinfo.release.description + ' / ' : '') + (luciversion || ''),"

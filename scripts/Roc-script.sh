@@ -16,7 +16,6 @@ esac
 
 resolve_config_file() {
   local config_file="$1"
-
   if [ -f "$config_file" ]; then
     printf '%s\n' "$config_file"
   elif [ -f "$WORKSPACE/$config_file" ]; then
@@ -31,7 +30,6 @@ CONFIG_FILES=()
 if [ -n "$DEVICE_CONFIG_FILE" ]; then
   CONFIG_FILES+=("$(resolve_config_file "$DEVICE_CONFIG_FILE")")
 elif [ -f .config ]; then
-  # Keep direct invocations compatible with an existing OpenWrt .config.
   CONFIG_FILES+=("$PWD/.config")
 else
   echo "Error: pass the device config as the first argument or CONFIG_FILE" >&2
@@ -41,7 +39,6 @@ CONFIG_FILES+=("$(resolve_config_file "$GENERAL_CONFIG_FILE")")
 
 config_symbol_enabled() {
   local symbol="$1"
-
   awk -v symbol="$symbol" '
     { sub(/\r$/, "") }
     $0 == symbol "=y" || $0 == symbol "=m" { enabled = 1; next }
@@ -52,7 +49,6 @@ config_symbol_enabled() {
 
 target_device_package_enabled() {
   local package_name="$1"
-
   awk -v package_name="$package_name" '
     { sub(/\r$/, "") }
     /^CONFIG_TARGET_DEVICE_PACKAGES_[^=]+="/ {
@@ -72,13 +68,11 @@ target_device_package_enabled() {
 
 package_enabled() {
   local package_name
-
   for package_name in "$@"; do
     if config_symbol_enabled "CONFIG_PACKAGE_$package_name" || target_device_package_enabled "$package_name"; then
       return 0
     fi
   done
-
   return 1
 }
 
@@ -86,19 +80,16 @@ clone_with_retry() {
   local target_dir="$1"
   local attempt
   shift
-
   for ((attempt = 1; attempt <= GIT_CLONE_RETRY_COUNT; attempt++)); do
     rm -rf "$target_dir"
     if git clone "$@" "$target_dir"; then
       return 0
     fi
-
     if [ "$attempt" -lt "$GIT_CLONE_RETRY_COUNT" ]; then
       echo "Git clone failed; retrying ($((attempt + 1))/$GIT_CLONE_RETRY_COUNT): ${*: -1}" >&2
       sleep $((attempt * 2))
     fi
   done
-
   echo "Error: git clone failed after $GIT_CLONE_RETRY_COUNT attempts: ${*: -1}" >&2
   return 1
 }
@@ -109,7 +100,6 @@ record_git_revision() {
   local checkout_dir="$3"
   local commit
   local revision
-
   commit="$(git -C "$checkout_dir" rev-parse HEAD)"
   printf -v revision '%s\t%s\t%s' "$repo_url" "$branch" "$commit"
   grep -Fqx -- "$revision" "$THIRD_PARTY_SOURCES_FILE" || printf '%s\n' "$revision" >> "$THIRD_PARTY_SOURCES_FILE"
@@ -119,7 +109,6 @@ clone_repository() {
   local repo_url="$1"
   local branch="$2"
   local target_dir="$3"
-
   clone_with_retry "$target_dir" \
     --depth=1 \
     --no-tags \
@@ -129,12 +118,56 @@ clone_repository() {
   record_git_revision "$repo_url" "$branch" "$target_dir"
 }
 
+git_sparse_clone() {
+  local branch="$1"
+  local repourl="$2"
+  local repodir
+  local sparse_path
+  shift 2
+  repodir="$(basename "${repourl%.git}")"
+  clone_with_retry "$repodir" \
+    --depth=1 \
+    --no-tags \
+    --branch "$branch" \
+    --single-branch \
+    --filter=blob:none \
+    --sparse \
+    "$repourl"
+  (
+    cd "$repodir"
+    git sparse-checkout set "$@"
+  )
+  record_git_revision "$repourl" "$branch" "$repodir"
+  for sparse_path in "$@"; do
+    rm -rf "package/$(basename "$sparse_path")"
+    mv "$repodir/$sparse_path" package/
+  done
+  rm -rf "$repodir"
+}
+
 mkdir -p "$(dirname "$THIRD_PARTY_SOURCES_FILE")"
 printf 'Repository\tBranch\tCommit\n' > "$THIRD_PARTY_SOURCES_FILE"
 
-# 修改默认IP & 固件名称 & 编译署名和时间
-sed -i 's/192.168.1.1/192.168.1.1/g' package/base-files/files/bin/config_generate
-sed -i "s/hostname='.*'/hostname='Roc'/g" package/base-files/files/bin/config_generate
+# ==========================================
+# 核心修改区：通过 sed 替换源码默认设置
+# ==========================================
+echo "Applying custom default settings..."
+
+# 修改默认IP
+sed -i 's/192.168.1.1/192.168.68.1/g' package/base-files/files/bin/config_generate
+# 修改主机名
+sed -i "s/hostname='.*'/hostname='JDAX1800'/g" package/base-files/files/bin/config_generate
+# 修改时区为上海
+sed -i "s/timezone='UTC'/timezone='CST-8'/g" package/base-files/files/bin/config_generate
+sed -i "s/zonename='UTC'/zonename='Asia\/Shanghai'/g" package/base-files/files/bin/config_generate
+
+# 修改默认 WiFi 名称和密码
+sed -i 's/OpenWrt/JDAX1800/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
+sed -i 's/OpenWrt/JDAX1800-5G/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
+sed -i 's/encryption=none/encryption=psk2/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
+sed -i 's/key=.*/key=huahua123/g' package/kernel/mac80211/files/lib/wifi/mac80211.sh
+
+# 修改 LuCI 版本显示（保留原作者逻辑）
 luci_system_js="feeds/luci/modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js"
 firmware_version_anchor="_('Firmware Version'), (L.isObject(boardinfo.release) ? boardinfo.release.description + ' / ' : '') + (luciversion || ''),"
 grep -Fq "$firmware_version_anchor" "$luci_system_js" || { echo "Error: LuCI firmware version anchor was not found in $luci_system_js" >&2; exit 1; }
@@ -151,102 +184,11 @@ sed -i "s#_('Firmware Version'), (L\.isObject(boardinfo\.release) ? boardinfo\.r
                 }, [ 'Built by Roc $(date "+%Y-%m-%d %H:%M:%S")' ])\n \
             ]),#" "$luci_system_js"
 
-# 调整NSS驱动q6_region内存区域预留大小（ipq6018.dtsi默认预留85MB，ipq6018-512m.dtsi默认预留55MB，带WiFi必须至少预留54MB，以下分别是改成预留16MB、32MB、64MB和96MB）
-# sed -i 's/reg = <0x0 0x4ab00000 0x0 0x[0-9a-f]\+>/reg = <0x0 0x4ab00000 0x0 0x01000000>/' target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6018-512m.dtsi
-# sed -i 's/reg = <0x0 0x4ab00000 0x0 0x[0-9a-f]\+>/reg = <0x0 0x4ab00000 0x0 0x02000000>/' target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6018-512m.dtsi
-# sed -i 's/reg = <0x0 0x4ab00000 0x0 0x[0-9a-f]\+>/reg = <0x0 0x4ab00000 0x0 0x04000000>/' target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6018-512m.dtsi
-# sed -i 's/reg = <0x0 0x4ab00000 0x0 0x[0-9a-f]\+>/reg = <0x0 0x4ab00000 0x0 0x06000000>/' target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6018-512m.dtsi
+# ==========================================
+# 第三方插件克隆区 (按你的需求保留)
+# ==========================================
 
-# 调节IPQ60XX的1.5GHz频率电压(从0.9375V提高到0.95V，过低可能导致不稳定，过高可能增加功耗和发热，具体数值需要根据实际情况调整)
-# sed -i 's/opp-microvolt = <937500>;/opp-microvolt = <950000>;/' target/linux/qualcommax/patches-6.12/0038-v6.16-arm64-dts-qcom-ipq6018-add-1.5GHz-CPU-Frequency.patch
-
-# Git稀疏克隆，只克隆指定目录到本地
-git_sparse_clone() {
-  local branch="$1"
-  local repourl="$2"
-  local repodir
-  local sparse_path
-  shift 2
-
-  repodir="$(basename "${repourl%.git}")"
-  clone_with_retry "$repodir" \
-    --depth=1 \
-    --no-tags \
-    --branch "$branch" \
-    --single-branch \
-    --filter=blob:none \
-    --sparse \
-    "$repourl"
-  (
-    cd "$repodir"
-    git sparse-checkout set "$@"
-  )
-  record_git_revision "$repourl" "$branch" "$repodir"
-
-  for sparse_path in "$@"; do
-    rm -rf "package/$(basename "$sparse_path")"
-    mv "$repodir/$sparse_path" package/
-  done
-  rm -rf "$repodir"
-}
-
-# Aria2 & nginx & Go & DDNS & frp & UPnP & Wol
-rm -rf feeds/packages/lang/golang
-git_sparse_clone master https://github.com/laipeng668/packages lang/golang
-mv package/golang feeds/packages/lang/golang
-
-if package_enabled luci-app-aria2 aria2; then
-  rm -rf feeds/packages/net/aria2
-  git_sparse_clone aria2 https://github.com/laipeng668/packages net/aria2
-  mv package/aria2 feeds/packages/net/aria2
-fi
-if package_enabled ariang; then
-  rm -rf feeds/packages/net/ariang
-  git_sparse_clone ariang https://github.com/laipeng668/packages net/ariang
-  mv package/ariang feeds/packages/net/ariang
-fi
-
-if package_enabled nginx nginx-full nginx-ssl luci-app-nginx; then
-  rm -rf feeds/packages/net/nginx
-  git_sparse_clone nginx https://github.com/laipeng668/packages net/nginx
-  mv package/nginx feeds/packages/net/nginx
-fi
-
-if package_enabled luci-app-ddns ddns-scripts ddns-scripts-cloudflare; then
-  rm -rf feeds/packages/net/ddns-scripts
-  git_sparse_clone master https://github.com/laipeng668/packages net/ddns-scripts
-  mv package/ddns-scripts feeds/packages/net/ddns-scripts
-fi
-if package_enabled luci-app-ddns; then
-  rm -rf feeds/luci/applications/luci-app-ddns
-  git_sparse_clone master https://github.com/laipeng668/luci applications/luci-app-ddns
-  mv package/luci-app-ddns feeds/luci/applications/luci-app-ddns
-fi
-
-if package_enabled frp frpc frps luci-app-frpc luci-app-frps; then
-  rm -rf \
-    feeds/packages/net/frp
-  git_sparse_clone frp-binary https://github.com/laipeng668/packages net/frp
-  mv package/frp feeds/packages/net/frp
-fi
-
-frp_luci_paths=()
-if package_enabled luci-app-frpc; then
-  rm -rf feeds/luci/applications/luci-app-frpc
-  frp_luci_paths+=(applications/luci-app-frpc)
-fi
-if package_enabled luci-app-frps; then
-  rm -rf feeds/luci/applications/luci-app-frps
-  frp_luci_paths+=(applications/luci-app-frps)
-fi
-if [ "${#frp_luci_paths[@]}" -gt 0 ]; then
-  git_sparse_clone frp https://github.com/laipeng668/luci "${frp_luci_paths[@]}"
-  for frp_luci_path in "${frp_luci_paths[@]}"; do
-    mv "package/$(basename "$frp_luci_path")" "feeds/luci/$frp_luci_path"
-    sed -i '/^LUCI_EXTRA_DEPENDS:=/d' "feeds/luci/$frp_luci_path/Makefile"
-  done
-fi
-
+# 1. UPnP
 if package_enabled luci-app-upnp miniupnpd; then
   rm -rf feeds/packages/net/miniupnpd
   git_sparse_clone master https://github.com/immortalwrt/packages net/miniupnpd
@@ -258,13 +200,14 @@ if package_enabled luci-app-upnp; then
   mv package/luci-app-upnp feeds/luci/applications/luci-app-upnp
 fi
 
+# 2. 网络唤醒 WOL
 if package_enabled luci-app-wol; then
   rm -rf feeds/luci/applications/luci-app-wol
   git_sparse_clone master https://github.com/immortalwrt/luci applications/luci-app-wol
   mv package/luci-app-wol feeds/luci/applications/luci-app-wol
 fi
 
-# Themes and standalone applications. A config application pulls in its theme as a dependency.
+# 3. 主题美化 Argon & Aurora
 if package_enabled luci-theme-argon luci-app-argon-config; then
   rm -rf feeds/luci/themes/luci-theme-argon
   clone_repository https://github.com/jerrykuku/luci-theme-argon master feeds/luci/themes/luci-theme-argon
@@ -273,7 +216,6 @@ if package_enabled luci-app-argon-config; then
   rm -rf feeds/luci/applications/luci-app-argon-config
   clone_repository https://github.com/jerrykuku/luci-app-argon-config master feeds/luci/applications/luci-app-argon-config
 fi
-
 if package_enabled luci-theme-aurora luci-app-aurora-config; then
   rm -rf feeds/luci/themes/luci-theme-aurora
   clone_repository https://github.com/eamonxg/luci-theme-aurora master feeds/luci/themes/luci-theme-aurora
@@ -283,58 +225,39 @@ if package_enabled luci-app-aurora-config; then
   clone_repository https://github.com/eamonxg/luci-app-aurora-config master feeds/luci/applications/luci-app-aurora-config
 fi
 
-if package_enabled luci-app-openlist2 openlist2; then
-  clone_repository https://github.com/laipeng668/luci-app-openlist2 main package/openlist2
-fi
-
+# 4. Lucky
 if package_enabled luci-app-lucky lucky; then
   clone_repository https://github.com/gdy666/luci-app-lucky main package/luci-app-lucky
 fi
 
+# 5. 微信推送 WechatPush
 if package_enabled luci-app-wechatpush; then
   rm -rf feeds/luci/applications/luci-app-wechatpush
   clone_repository https://github.com/tty228/luci-app-wechatpush master package/luci-app-wechatpush
 fi
 
+# 6. 应用过滤 AppFilter
 if package_enabled luci-app-oaf open-app-filter; then
   rm -rf feeds/luci/applications/luci-app-appfilter feeds/packages/net/open-app-filter
   clone_repository https://github.com/destan19/OpenAppFilter.git master package/OpenAppFilter
 fi
 
-if package_enabled luci-app-gecoosac gecoosac; then
-  clone_repository https://github.com/laipeng668/luci-app-gecoosac main package/luci-app-gecoosac
-fi
-
-if package_enabled luci-app-athena-led luci-i18n-athena-led-zh-cn; then
-  clone_repository https://github.com/NONGFAH/luci-app-athena-led main package/luci-app-athena-led
-  chmod +x package/luci-app-athena-led/root/etc/init.d/athena_led package/luci-app-athena-led/root/usr/sbin/athena-led
-fi
-
-### PassWall & OpenClash ###
-
+# 7. PassWall 及其核心组件
 if package_enabled luci-app-passwall luci-app-passwall2; then
-  # 移除 OpenWrt Feeds 自带的核心库
   rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls}
   clone_repository https://github.com/Openwrt-Passwall/openwrt-passwall-packages main package/passwall-packages
 fi
-
 if package_enabled luci-app-passwall; then
   rm -rf feeds/luci/applications/luci-app-passwall
   clone_repository https://github.com/Openwrt-Passwall/openwrt-passwall main package/luci-app-passwall
 fi
-
 if package_enabled luci-app-passwall2; then
   rm -rf feeds/luci/applications/luci-app-passwall2
   clone_repository https://github.com/Openwrt-Passwall/openwrt-passwall2 main package/luci-app-passwall2
 fi
 
-if package_enabled luci-app-openclash; then
-  rm -rf feeds/luci/applications/luci-app-openclash
-  clone_repository https://github.com/vernesong/OpenClash master package/luci-app-openclash
-fi
-
-# 清理 PassWall 的 chnlist 规则文件
-# echo "baidu.com"  > package/luci-app-passwall/luci-app-passwall/root/usr/share/passwall/rules/chnlist
-
+# ==========================================
+# 更新并安装 feeds
+# ==========================================
 ./scripts/feeds update -i -a
 ./scripts/feeds install -a

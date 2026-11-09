@@ -26,4 +26,8 @@ jobs:
       manifest_file: immortalwrt-qualcommax-ipq60xx.manifest
       delete_old_workflows: true
       release_summary: >-
-        这是开启全功能NSS的6.18内核固件，默认主题为Aurora；该固件在ImmortalWrt的基础上，添加了额外的软件包cpufreq、ddns、upnp、wol、samba4、vlmcsd、aria2、autoreboot、uhttpd、frps、frpc、diskman、hd-idle、acme、openlist2、wireguard、watchcat、3cat、passwall、gecoosac，并添加了若干工具，具体详见JDCloud.config(NoWiFi.config)和General.config。
+        京东云 AX1800 Pro（亚瑟）ImmortalWrt 25.12 固件，6.12 内核 / 全功能 NSS，默认主题 Aurora。
+        已固化 ath11k nss_offload=0（修复 WiFi 拿不到 IP），LAN 默认管理地址 192.168.68.1；
+        内置 OpenClash（luci feed + Mihomo 内核）与 EasyTier，ZeroTier / PassWall / autoreboot 等已移除；
+        上行默认 WAN DHCP + 双频 AP，WAN 直连或 5G 中继由刷机后脚本切换。
+        插件清单见 configs/General.config 末尾 v2 段，修复说明见 WB-FIXES.md。

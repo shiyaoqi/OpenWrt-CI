@@ -21,7 +21,7 @@ jobs:
       repo_branch: openwrt-25.12
       config_file: configs/JDCloud.config
       firmware_tag: JDCloud
-      kernel_file: kernel-6.18
+      kernel_file: kernel-6.12
       artifact_prefix: Arthur.Athena
       manifest_file: immortalwrt-qualcommax-ipq60xx.manifest
       delete_old_workflows: true

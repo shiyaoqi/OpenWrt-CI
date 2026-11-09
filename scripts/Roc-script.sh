@@ -255,3 +255,15 @@ fi
 # ==========================================
 ./scripts/feeds update -i -a
 ./scripts/feeds install -a
+
+# ==========================================
+# WorkBuddy 固件级修复 v2（详见仓库根目录 WB-FIXES.md）
+#   1. 编译期把 ath11k nss_offload 固化成 0（WiFi 拿不到 IP 的根因）
+#   2. 注入 files/ 首启脚本与 sysupgrade 保留清单
+#   3. 补入 EasyTier 包源（upstream 里没这个包）
+#   4. 下载并内置 Mihomo 内核（OpenClash 用，luci feed 只提供界面）
+#   调用位置必须在 feeds install 之后、最终 make defconfig 之前。
+# 注意：改动本文件会改变 Build-OpenWrt.yml 里的 CUSTOMIZATION_HASH，
+#       从而让 ccache/staging 缓存失效并真正重新编译。
+# ==========================================
+bash "$WORKSPACE/scripts/wb-fixes.sh" "$WORKSPACE"

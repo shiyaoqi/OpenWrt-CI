@@ -1,0 +1,112 @@
+#!/bin/sh
+# =============================================================================
+# WorkBuddy 首启固化脚本 v2（编译进 squashfs）
+#   执行时机: 首次开机 / 恢复出厂设置 / 不保留配置刷机
+#   设计原则: 幂等、只补缺失、不含任何凭据、不覆盖用户后续修改
+#   v2 变更: 上行中性默认 —— 不预设 WAN 直连或 5G 中继，
+#            两种上行由刷机后运行 extras/ 下的本地脚本切换。
+#            LAN 管理地址固定为 192.168.68.1。
+#   可手动重跑: sh /rom/etc/uci-defaults/99-wb-fixes
+# =============================================================================
+
+log() {
+  logger -t wb-fixes "$1"
+  echo "[wb-fixes] $1"
+}
+
+# --- 1. ath11k NSS offload 兜底 ---------------------------------------------
+# 编译期 sed 已把 /rom 版本改成 0 时，这里不写 overlay，保持系统干净；
+# 万一上游源码结构变了导致 sed 未命中，这里在 overlay 覆盖，效果等价。
+MOD=/etc/modules.d/ath11k
+if [ -f "$MOD" ]; then
+  if grep -q 'nss_offload=1' "$MOD"; then
+    sed -i 's/nss_offload=1/nss_offload=0/' "$MOD"
+    log "ath11k: overlay 覆盖为 nss_offload=0（编译期 sed 未生效的兜底）"
+  else
+    log "ath11k: 已是 nss_offload=0，无需改动"
+  fi
+else
+  printf 'ath11k nss_offload=0 frame_mode=2\n' > "$MOD"
+  log "ath11k: 已生成 $MOD（nss_offload=0）"
+fi
+
+# --- 2. 恢复 DHCP 日志 -------------------------------------------------------
+if [ -z "$(uci -q get dhcp.@dnsmasq[0].logdhcp)" ]; then
+  uci set dhcp.@dnsmasq[0].logdhcp='1'
+  log "dnsmasq: 已开启 logdhcp（DHCP 交互重新进入 logread）"
+else
+  log "dnsmasq: logdhcp 已有设置，保持原值"
+fi
+# 注意: 不触碰 noresolv / server / dns_redirect / cachesize。
+# 这些由 OpenClash 首次启用时自行接管；无代理时写入反而会让 DNS 挂掉。
+uci commit dhcp
+
+# --- 3. IPv6 -----------------------------------------------------------------
+# v2: 不再预先禁用 LAN RA。WAN 直连时运营商可能下发 IPv6，
+#     预先 ra=disabled 会让 IPv6 永远起不来。
+#     仅在确认使用「无 IPv6 上行的 5G 中继」时，由 extras/enable-uplink.sh 关闭。
+log "IPv6: 保持发行版默认（WAN 直连可用；中继场景由 enable-uplink.sh 关闭 RA）"
+
+# --- 4. WAN 口保持 DHCP 客户端（直连开箱可用）--------------------------------
+# 只补缺失项，不动 device/ifname（DSA 设备名由 board.json 决定）。
+if [ -z "$(uci -q get network.wan.proto)" ]; then
+  uci set network.wan.proto='dhcp'
+  log "network: wan.proto 补为 dhcp"
+else
+  log "network: wan.proto=$(uci -q get network.wan.proto)，保持原值"
+fi
+uci commit network
+
+# --- 4b. LAN 管理地址固定为 192.168.68.1 ------------------------------------
+# 编译期 Roc-script.sh:157 已把 config_generate 里的 192.168.1.1
+# sed 成 192.168.68.1；但仓库 README 写 192.168.2.1（旧文案），且若上游
+# 默认值再变、或有其它 default-settings 脚本覆盖，编译期 sed 会失效。
+# 99- 前缀保证本脚本最后执行，这里在 UCI 层幂等钉死一次，只补差异。
+LAN_WANT='192.168.68.1'
+LAN_NOW=$(uci -q get network.lan.ipaddr || true)
+if [ "$LAN_NOW" != "$LAN_WANT" ]; then
+  uci set network.lan.ipaddr="$LAN_WANT"
+  [ -n "$(uci -q get network.lan.netmask)" ] || uci set network.lan.netmask='255.255.255.0'
+  uci commit network
+  log "network: LAN 管理地址设为 $LAN_WANT（原 ${LAN_NOW:-未设置}）"
+else
+  log "network: LAN 管理地址已是 $LAN_WANT"
+fi
+# dnsmasq 的 start/limit 是相对值，会随 lan.ipaddr 自动同网段，无需改。
+# 注意: 若 WAN 上级光猫也在 192.168.68.0/24，会与 LAN 同段冲突，
+#       此时需另把 LAN 改成别的网段（enable-wan.sh 会给出告警）。
+
+# --- 5. WiFi 默认结构：双频 AP ------------------------------------------------
+# v2: 两个 radio 都做 AP，不预设任何中继（STA）section。
+#     SSID 固定但不设密码 —— 密码属于用户凭据，绝不写进公开固件。
+#     !! 刷机后必须立刻设置 WiFi 密码，见 README「刷机后必做三件事」。
+if [ ! -f /etc/config/wireless ]; then
+  wifi config 2>/dev/null || true
+fi
+if [ -f /etc/config/wireless ]; then
+  for r in radio0 radio1; do
+    [ -n "$(uci -q get wireless.default_${r}.ssid)" ] || continue
+    uci set wireless.default_${r}.disabled='0'
+    uci set wireless.default_${r}.network='lan'
+    uci set wireless.default_${r}.encryption='none'
+  done
+  uci set wireless.default_radio0.ssid='JDAX1800-5G'
+  uci set wireless.default_radio1.ssid='JDAX1800'
+  uci commit wireless
+  log "wireless: 5G=JDAX1800-5G / 2.4G=JDAX1800，均已启用（开放网络，请尽快加密）"
+else
+  log "wireless: 配置尚未生成，跳过（重启后可由 wifi config 生成）"
+fi
+
+# --- 6. OpenClash 内核软链兜底 ------------------------------------------------
+# 编译期已把 Mihomo 放进 files/etc/openclash/core/clash_meta。
+# 个别 OpenClash 版本启动时会找 /etc/openclash/clash，这里补一个软链。
+if [ -x /etc/openclash/core/clash_meta ] && [ ! -e /etc/openclash/clash ]; then
+  ln -s /etc/openclash/core/clash_meta /etc/openclash/clash
+  log "openclash: 已补内核软链 /etc/openclash/clash"
+fi
+
+log "完成。管理地址 http://$LAN_WANT（root / 首次登录设置密码）。"
+log "请按实际上行方式执行 extras/enable-wan.sh 或 extras/enable-uplink.sh，"
+log "并运行 extras/verify-after-flash.sh 核对。"
+exit 0

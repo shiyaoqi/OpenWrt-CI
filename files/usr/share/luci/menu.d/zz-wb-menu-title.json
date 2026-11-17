@@ -1,0 +1,14 @@
+{
+	"admin/services/nlbw": {
+		"title": "带宽监控"
+	},
+	"admin/services/nlbw/display": {
+		"title": "流量明细"
+	},
+	"admin/services/nlbw/config": {
+		"title": "统计设置"
+	},
+	"admin/services/nlbw/backup": {
+		"title": "数据备份"
+	}
+}

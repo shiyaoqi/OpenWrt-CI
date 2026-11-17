@@ -5,5 +5,13 @@
 				"/etc/wb-hide-status-firewall": "file"
 			}
 		}
+	},
+
+	"admin/vpn": {
+		"depends": {
+			"fs": {
+				"/etc/wb-hide-vpn": "file"
+			}
+		}
 	}
 }

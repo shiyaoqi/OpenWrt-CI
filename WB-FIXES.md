@@ -214,6 +214,20 @@ wb-dhcp -h
 
 **真机即时部署**（不等云编译）：`deploy-wb-easytier-move-20261117.sh` —— 纯 sed 改写既有文件、不新增文件，执行前把原件备份到 `/tmp/wb-et-backup`，改完清 `/tmp/luci-indexcache*` 并重启 uhttpd。回滚：`cp /tmp/wb-et-backup/easytier.lua` 回原位并从备份恢复 htm。
 
+- **顶层「VPN」容器本身还在官方 `luci-base.json` 里**（`"admin/vpn": {title:"VPN", order:50, action:firstchild}`），
+  只删控制器那行会留下一个点进去没有内容的空分类。`files/usr/share/luci/menu.d/zz-wb-menu-trim.json`
+  给它加 `depends.fs = {"/etc/wb-hide-vpn": "file"}`：该标记文件永不创建 → 菜单永不渲染，
+  且不动官方 JSON（上游升级不会失配）。`admin/status/nftables` 用同一个套路（`/etc/wb-hide-status-firewall`）。
+- **实测菜单树**（`/cgi-bin/luci/admin/menu` 的 JSON）：`VPN` 为 `satisfied:false`，
+  `服务` 下顺序为 ACME / DDNS-Go / 设备限速 / 带宽监控 / Watchcat / Wake on LAN / EasyTier / OpenClash。
+
+## 带宽监控菜单汉化（2026-11-17 追加）
+
+上游 `luci-app-nlbwmon` 的菜单标题是英文 `Bandwidth Monitor`，子页是 `Display` / `Configuration` / `Backup`。
+新增 `files/usr/share/luci/menu.d/zz-wb-menu-title.json` 只覆盖 4 个 `title` 字段（`带宽监控` / `流量明细` /
+`统计设置` / `数据备份`），`action`、`depends` 等字段不动 —— menu.d 是**按路径深度合并**、同名字典序靠后的文件覆盖前者字段，
+`zz-` 前缀保证排在 `luci-app-nlbwmon.json` 之后。页面本身仍是官方实现（只额外加了顶部开关按钮）。
+
 ## 带宽统计默认关闭 + 只保留近 1 个账期（2026-11-17 追加）
 
 上游 nlbwmon 的默认值在内存小的机器上代价偏高：`database_generations 10`（保留 10 个账期）、

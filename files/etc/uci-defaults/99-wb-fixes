@@ -106,6 +106,23 @@ if [ -x /etc/openclash/core/clash_meta ] && [ ! -e /etc/openclash/clash ]; then
   log "openclash: 已补内核软链 /etc/openclash/clash"
 fi
 
+# --- 7. 带宽统计（nlbwmon）：默认关闭 + 只保留近 1 个账期 ---------------------
+# 数据库在 /var/lib/nlbwmon（tmpfs，占内存）。上游默认 database_generations=10，
+# 也就是把 10 个月的账本一直留在 RAM 里，512MB 机型上既占内存、打开显示页又慢。
+# 这里压到 1 个账期、2000 条记录，并把服务默认关掉，需要时在页面顶部按钮开启。
+if [ -f /etc/config/nlbwmon ]; then
+  uci -q set nlbwmon.@nlbwmon[0].database_generations='1'
+  uci -q set nlbwmon.@nlbwmon[0].database_limit='2000'
+  uci -q set nlbwmon.@nlbwmon[0].refresh_interval='60s'
+  uci -q commit nlbwmon
+  log "nlbwmon: 只保留 1 个账期 / 2000 条记录 / 刷新 60s"
+fi
+if [ -x /etc/init.d/nlbwmon ]; then
+  /etc/init.d/nlbwmon stop >/dev/null 2>&1 || true
+  /etc/init.d/nlbwmon disable >/dev/null 2>&1 || true
+  log "nlbwmon: 默认关闭（「服务 → 带宽监控」页顶部按钮可开启）"
+fi
+
 log "完成。管理地址 http://$LAN_WANT（root / 首次登录设置密码）。"
 log "请按实际上行方式执行 extras/enable-wan.sh 或 extras/enable-uplink.sh，"
 log "并运行 extras/verify-after-flash.sh 核对。"

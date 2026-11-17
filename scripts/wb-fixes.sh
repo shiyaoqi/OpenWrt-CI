@@ -57,6 +57,103 @@ fi
 mkdir -p files
 cp -a "$WORKSPACE/files/." files/
 find files/etc/uci-defaults -type f -exec chmod 0755 {} + 2>/dev/null || true
+# 手动清理离线客户端租约的脚本，必须是可执行文件
+if [ -f files/usr/bin/wb-clean-clients ]; then
+  chmod 0755 files/usr/bin/wb-clean-clients
+  echo "[WB] 离线客户端清理脚本: 已注入 /usr/bin/wb-clean-clients (0755)"
+else
+  echo "[WB] WARN: files/usr/bin/wb-clean-clients 缺失，固件将不含清理命令" >&2
+fi
+# DHCP 静态绑定实时管理（list/bind/unbind），必须是可执行文件
+if [ -f files/usr/bin/wb-dhcp ]; then
+  chmod 0755 files/usr/bin/wb-dhcp
+  echo "[WB] DHCP绑定管理脚本: 已注入 /usr/bin/wb-dhcp (0755)"
+else
+  echo "[WB] WARN: files/usr/bin/wb-dhcp 缺失，固件将不含 DHCP 绑定命令" >&2
+fi
+# 系统日志/内核日志页「清空日志」按钮后端，必须是可执行文件
+if [ -f files/usr/bin/wb-clear-logs ]; then
+  chmod 0755 files/usr/bin/wb-clear-logs
+  echo "[WB] 日志清空脚本: 已注入 /usr/bin/wb-clear-logs (0755)"
+else
+  echo "[WB] WARN: files/usr/bin/wb-clear-logs 缺失，日志页将无清空按钮" >&2
+fi
+# LuCI 自定义页面：2026-11-17 起全部撤除，统一用官方页面
+# 注 1：离线清理已取消独立菜单，改为「状态→概览→DHCP 租约」页内联按钮，
+#       其 view/menu 已删除，仅保留下方 ACL 供按钮调用 wb-clean-clients。
+# 注 2：端口转发页(wbforward)已删除——「网络→防火墙」自带「端口转发」标签页。
+# 注 3：静态IP分配页(wbdhcp)已删除——「网络→DHCP/DNS」自带「静态地址分配」标签页。
+#       两处读写的是同一份 UCI（redirect / config host），保留自建页面属于重复维护。
+# /usr/bin/wb-dhcp 命令保留，SSH 下 wb-dhcp list|bind|unbind 仍可用于批量绑定。
+if [ -f files/usr/bin/wb-dhcp ]; then
+  echo "[WB] 提示: wb-dhcp 命令保留（无图形页面，走 SSH 使用）"
+fi
+# 菜单裁剪：隐藏「状态→防火墙」（与「网络→防火墙」重复），同时撤掉其复杂摘要页覆盖
+# 实现：同路径节点被后加载的 menu.d 覆盖 depends，fs 指向永不存在的文件 → satisfied=false
+#      dispatcher 建树时直接跳过，既不显示入口，也不会残留 404 死链。
+if [ -f files/usr/share/luci/menu.d/zz-wb-menu-trim.json ]; then
+  chmod 0644 files/usr/share/luci/menu.d/zz-wb-menu-trim.json
+  echo "[WB] 菜单裁剪: 已注入 (隐藏 状态→防火墙)"
+fi
+# 日志页清空按钮：覆盖官方 status/syslog.js 与 status/dmesg.js，不改菜单
+for wbview in syslog dmesg; do
+  wbfile="files/www/luci-static/resources/view/status/$wbview.js"
+  if [ -f "$wbfile" ]; then
+    chmod 0644 "$wbfile"
+    echo "[WB] 日志清空按钮: 已注入 (覆盖 status/$wbview.js)"
+  else
+    echo "[WB] WARN: $wbfile 缺失，日志页将无清空按钮" >&2
+  fi
+done
+# 自动端口映射中文页：覆盖 luci-app-upnp 的官方视图与菜单
+# 原为「服务 → UPnP IGD & PCP」，改名为「自动端口映射」并归入 网络（紧接端口转发/静态IP分配）
+if [ -f files/www/luci-static/resources/view/upnp/upnp.js ] &&
+   [ -f files/usr/share/luci/menu.d/luci-app-upnp.json ]; then
+  chmod 0644 files/www/luci-static/resources/view/upnp/upnp.js \
+             files/usr/share/luci/menu.d/luci-app-upnp.json
+  echo "[WB] 自动端口映射中文页: 已注入 (view + menu，归入 网络)"
+else
+  echo "[WB] WARN: 自动端口映射页面文件缺失，仍显示官方「服务 → UPnP IGD & PCP」" >&2
+fi
+
+# 无菜单 ACL：授权 DHCP 租约页按钮运行 wb-clean-clients，日志页按钮运行 wb-clear-logs
+if [ -f files/usr/share/rpcd/acl.d/luci-app-wbclean.json ]; then
+  chmod 0644 files/usr/share/rpcd/acl.d/luci-app-wbclean.json
+  echo "[WB] 离线清理/日志清空 ACL: 已注入 (无菜单)"
+fi
+
+# 设备限速（eqos）：中文页面 + 「仅走 IPv4」/「仅局域网」两列 + 保存后同步防火墙规则
+#   eqos 命令本体由 luci-app-eqos 包提供（/usr/sbin/eqos），这里只覆盖页面与 init。
+if [ -f files/usr/bin/wb-eqos-sync ]; then
+  chmod 0755 files/usr/bin/wb-eqos-sync
+  echo "[WB] 仅局域网/仅走IPv4 同步脚本: 已注入 /usr/bin/wb-eqos-sync (0755)"
+fi
+if [ -f files/www/luci-static/resources/view/eqos.js ]; then
+  chmod 0644 files/www/luci-static/resources/view/eqos.js
+  echo "[WB] 设备限速中文页: 已注入 (覆盖 view/eqos.js，含仅走IPv4/仅局域网两列)"
+fi
+if [ -f files/etc/init.d/eqos ]; then
+  chmod 0755 files/etc/init.d/eqos
+  echo "[WB] eqos 启动脚本: 已覆盖 (reload 时调用 wb-eqos-sync)"
+fi
+if [ -f files/usr/share/luci/menu.d/luci-app-eqos.json ]; then
+  chmod 0644 files/usr/share/luci/menu.d/luci-app-eqos.json
+  echo "[WB] 设备限速菜单: 已注入 (服务 → 设备限速，order 60)"
+fi
+
+# 带宽统计（nlbwmon）：默认关闭 + 只保留 1 个账期 + 页面顶部开关按钮
+if [ -f files/usr/bin/wb-nlbw ]; then
+  chmod 0755 files/usr/bin/wb-nlbw
+  echo "[WB] 带宽统计开关脚本: 已注入 /usr/bin/wb-nlbw (0755，含 conntrack acct 收尾)"
+fi
+if [ -f files/www/luci-static/resources/view/nlbw/display.js ]; then
+  chmod 0644 files/www/luci-static/resources/view/nlbw/display.js
+  echo "[WB] 带宽统计开关按钮: 已注入 (覆盖 view/nlbw/display.js)"
+fi
+if [ -f files/usr/share/rpcd/acl.d/luci-app-wbnlbw.json ]; then
+  chmod 0644 files/usr/share/rpcd/acl.d/luci-app-wbnlbw.json
+  echo "[WB] 带宽统计 ACL: 已注入 (供页面按钮调用 wb-nlbw)"
+fi
 
 echo "================ [WB 3/6] 校验 Wi-Fi 默认脚本路径 ================"
 # 之前云编译 sed package/kernel/mac80211/files/lib/wifi/mac80211.sh 报「文件不存在」，
@@ -89,6 +186,38 @@ if git clone --depth 1 -b main "$ET_REPO" "$TMP/easytier-src" >/dev/null 2>&1; t
   sed -i 's|\.\./version\.mk|version.mk|g' package/easytier/Makefile package/luci-app-easytier/Makefile
   echo "[WB] EasyTier 版本: $(grep EASYTIER_VERSION "$TMP/easytier-src/version.mk" | head -1)"
   grep -n 'version.mk' package/easytier/Makefile package/luci-app-easytier/Makefile || true
+
+  # ---- 菜单归并：顶层「VPN」→「服务 / EasyTier」 ----
+  # 上游把 EasyTier 挂在 admin/vpn 下并自建一个顶层「VPN」分类。本机不跑副路由
+  # EasyTier（方案 3 由 NAS 的 EasyTier 做子网代理），那个分类只剩一个空壳，
+  # 故把整棵子树搬到 admin/services，order 55 排在 ACME(50) 之后。
+  # 关键：5 个 htm 模板里的 AJAX 地址硬编码 admin/vpn/easytier（分段 url() 与
+  # 单字符串 url("admin/vpn/...") 两种写法都有），必须与控制器同步改，漏一处即 404。
+  ET_PKG=package/luci-app-easytier
+  sed -i \
+    -e '/entry({"admin", "vpn"}, firstchild(), "VPN", 45)/d' \
+    -e 's|{"admin", "vpn", "easytier"|{"admin", "services", "easytier"|g' \
+    -e 's|{"admin","vpn","easytier"|{"admin","services","easytier"|g' \
+    -e 's|_("EasyTier"), 46|_("EasyTier"), 55|' \
+    "$ET_PKG/luasrc/controller/easytier.lua"
+  for etpl in "$ET_PKG"/luasrc/view/easytier/*.htm; do
+    sed -i \
+      -e 's|url("admin", "vpn", "easytier"|url("admin", "services", "easytier"|g' \
+      -e 's|url("admin","vpn","easytier"|url("admin","services","easytier"|g' \
+      -e 's|url("admin/vpn/easytier/|url("admin/services/easytier/|g' \
+      -e "s|url('admin/vpn/easytier/|url('admin/services/easytier/|g" \
+      -e 's|url("admin/vpn/easytier")|url("admin/services/easytier")|g' \
+      "$etpl"
+  done
+  # 残留校验：宁可编译失败，也不出「菜单搬了但按钮全 404」的半成品。
+  # 正则 admin.{0,8}vpn 同时覆盖 "admin", "vpn" / "admin/vpn" / 无空格变体。
+  if grep -rnE 'admin.{0,8}vpn' "$ET_PKG/luasrc/" >/dev/null 2>&1; then
+    echo "[WB] ERROR: EasyTier 菜单归并后仍有 admin/vpn 残留，固件会带坏页面：" >&2
+    grep -rnE 'admin.{0,8}vpn' "$ET_PKG/luasrc/" >&2
+    exit 1
+  fi
+  echo "[WB] EasyTier 菜单已归并: 顶层 VPN → 服务/EasyTier (order 55)"
+
   echo "[WB] 已装入 package/easytier + package/luci-app-easytier"
 else
   # fail-soft：源站偶发不可达不该让整个编译失败，但必须显式告警

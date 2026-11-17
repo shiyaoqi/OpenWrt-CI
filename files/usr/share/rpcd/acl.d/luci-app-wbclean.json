@@ -1,6 +1,6 @@
 {
 	"luci-app-wbclean": {
-		"description": "允许 WB 离线客户端清理与日志清空按钮运行受限脚本",
+		"description": "允许 WB 离线客户端清理、日志清空与 DHCP 改名按钮运行受限脚本",
 		"read": {
 			"ubus": {
 				"file": [ "exec", "stat" ]
@@ -8,6 +8,7 @@
 			"file": {
 				"/usr/bin/wb-clean-clients*": [ "exec" ],
 				"/usr/bin/wb-clear-logs*": [ "exec" ],
+				"/usr/bin/wb-dhcp*": [ "exec" ],
 				"/tmp/dhcp.leases": [ "read", "write" ],
 				"/tmp/odhcpd.leases": [ "read", "write" ]
 			}
@@ -19,6 +20,7 @@
 			"file": {
 				"/usr/bin/wb-clean-clients*": [ "exec" ],
 				"/usr/bin/wb-clear-logs*": [ "exec" ],
+				"/usr/bin/wb-dhcp*": [ "exec" ],
 				"/tmp/dhcp.leases": [ "write" ],
 				"/tmp/odhcpd.leases": [ "write" ]
 			}

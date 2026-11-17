@@ -137,6 +137,14 @@ wb-dhcp -h
 > （view `wbdhcp/main.js`、menu、acl），静态绑定统一在 `网络 → DHCP/DNS → 静态地址分配` 里做。
 > **命令保留**：`/usr/bin/wb-dhcp` 仍在固件里，SSH 下可用 `wb-dhcp list | bind | unbind`
 > 批量查看/绑定/解绑（脚本直接写 UCI 并重启 dnsmasq，不依赖任何 LuCI 页面）。
+
+**改名入口（2026-11-17 追加，补删页后的空档）**：独立页删掉后，改设备显示名仍可在
+「状态 → 概览 → DHCP 租约」每行右侧的「重命名」按钮里做 —— 它调用
+`wb-dhcp bind <MAC> <名字>`（不传 IP 即「仅改名、IP 仍动态」），保存后 dnsmasq 重载，
+租约列表立刻显示新名字。按钮与「离线清理」共用 `luci-app-wbclean` ACL，
+为此在 ACL 里补了 `/usr/bin/wb-dhcp*` 的 `exec` 授权（读写两段都加）。
+官方「网络 → DHCP/DNS → 静态地址分配」也能设名字，但那里要连同 IP 一起填；
+只想改名、不想固定 IP 时用这个按钮或 `wb-dhcp bind <MAC> <名字>`。
 >
 > 原文留档：该页列出 `config host` 静态绑定，增删改走弹窗，即时 `uci save` + `commit('dhcp')` +
 > `dnsmasq restart`；MAC 归一化、IP 可留空（只改名不固定地址）；只显示管理员自己配置的绑定，

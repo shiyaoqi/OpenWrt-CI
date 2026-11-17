@@ -114,6 +114,14 @@ wb-dhcp -h
 - **隐私**：只显示/操作管理员自己写入的静态绑定；清租约按 MAC 过滤删除，不打印被删记录任何字段；
   不写日志、不落盘客户端明细。
 - 解绑后若设备在线，会按新配置重新 DHCP，名字回到客户端自报值；想保留自定义名就别解绑。
+- ⚠️ **名称只能是 ASCII**（`[A-Za-z0-9-]`，≤63 字符，不以 `-` 开头/结尾）。这不是"建议"：
+  dnsmasq 把 `config host` 的 name 当 hostname 解析，遇到中文会报
+  `bad DHCP host name at line N of /var/etc/dnsmasq.conf.*` 然后**整个实例启动失败**，
+  表现为**能 ping 通 IP 但所有域名都解析不了**（全屋断网）。2026-11-17 曾因输中文名踩过一次。
+  脚本现在会直接拒绝非 ASCII 名称。
+- **失败自动回滚**：`wb-dhcp bind/unbind` 改配置前把 `/etc/config/dhcp` 存到 `/tmp/wb-dhcp-lastgood`；
+  restart 后 `sleep 2` 用 `pgrep -x dnsmasq` 验活，起不来自动恢复备份并再重启一次。
+  （procd 的 restart 即使实例崩溃也可能返回 0，光看退出码不够。）
 
 回退：删掉 `files/usr/bin/wb-dhcp` 即可，不影响 `wb-clean-clients` 与其余功能。
 

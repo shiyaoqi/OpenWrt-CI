@@ -28,14 +28,17 @@
 # 注意
 #   · 解绑只是取消静态绑定并让该设备从租约列表消失；IP 是否立刻可被
 #     重新分配仍由 dnsmasq 租约机制决定（不保证立即释放）。
-#   · 名称建议用英文/数字/连字符；dnsmasq 会把它当 hostname 用，
-#     含空格或中文可能影响 DNS 解析，但 DHCP 与 LuCI 显示不受影响。
+#   · 名称只能用 ASCII 字母/数字/连字符（<=63 字符）。这不是"建议"而是
+#     硬限制：dnsmasq 把 config host 的 name 当域名用，遇到中文会报
+#     "bad DHCP host name" 并 **整个启动失败**，导致全屋 DNS 全断。
+#     本脚本会拒绝非 ASCII 名称，改中文显示名请用 wb-alias（纯展示层）。
 # =============================================================================
 set -eu
 
 DHCP_CFG="/etc/config/dhcp"
 LEASE4="/tmp/dhcp.leases"
 INIT_DNSMASQ="/etc/init.d/dnsmasq"
+BACKUP_CFG="/tmp/wb-dhcp-lastgood"
 TMP=""
 DRYRUN=0
 
@@ -114,6 +117,12 @@ find_sections_for_mac() {
 }
 
 # 应用配置变更：commit + 重载 dnsmasq，使名字/绑定即时生效
+backup_cfg() {
+	if [ -f "$DHCP_CFG" ]; then
+		cp -f "$DHCP_CFG" "$BACKUP_CFG" 2>/dev/null || true
+	fi
+}
+
 apply_changes() {
 	action="$1"
 	if ! uci -q commit dhcp; then
@@ -126,7 +135,28 @@ apply_changes() {
 	fi
 	if [ -x "$INIT_DNSMASQ" ]; then
 		if "$INIT_DNSMASQ" restart >/dev/null 2>&1; then
-			note "已重载 dnsmasq，$action；LuCI 刷新即可看到"
+			# procd 的 restart 即使实例起不来也可能返回 0，必须验活。
+			# 起不来就回滚，否则全屋 DNS 会一直挂着。
+			sleep 2
+			if pgrep -x dnsmasq >/dev/null 2>&1; then
+				note "已重载 dnsmasq，$action；LuCI 刷新即可看到"
+			else
+				note "错误: dnsmasq 启动失败（配置有问题），正在自动回滚…"
+				if [ -f "$BACKUP_CFG" ]; then
+					cp -f "$BACKUP_CFG" "$DHCP_CFG"
+					uci -q commit dhcp
+					"$INIT_DNSMASQ" restart >/dev/null 2>&1
+					sleep 2
+					if pgrep -x dnsmasq >/dev/null 2>&1; then
+						note "已回滚到修改前配置，dnsmasq 恢复正常，网络未受影响"
+					else
+						note "回滚后 dnsmasq 仍未起来，请在 LuCI 里检查 DHCP/DNS 设置"
+					fi
+				else
+					note "没有可用备份，请手动检查 /etc/config/dhcp"
+				fi
+				return 1
+			fi
 		else
 			note "警告: dnsmasq 重载失败，请手动执行 $INIT_DNSMASQ restart"
 			return 1
@@ -179,6 +209,7 @@ cmd_list() {
 }
 
 cmd_bind() {
+	backup_cfg
 	mac=$(norm_mac "${1:-}")
 	name="${2:-}"
 	ip="${3:-}"
@@ -197,6 +228,22 @@ cmd_bind() {
 		*'
 '*) note "错误: 名称不能包含换行"; return 2 ;;
 	esac
+	# dnsmasq 把 name 当 hostname：非 ASCII 会让它 "bad DHCP host name"
+	# 直接启动失败 → 全屋 DNS 挂掉。这里必须硬拦。
+	badchars=$(printf '%s' "$name" | tr -d 'A-Za-z0-9-' | wc -c)
+	if [ "$badchars" -gt 0 ]; then
+		note "错误: 名称只能包含字母、数字、连字符（-）"
+		note "      dnsmasq 不接受中文/空格/下划线，写了会让 DHCP 服务起不来"
+		note "      想显示中文名请用: wb-alias set <MAC> <中文名>"
+		return 2
+	fi
+	case "$name" in
+		-*|*-) note "错误: 名称不能以连字符开头或结尾"; return 2 ;;
+	esac
+	if [ "${#name}" -gt 63 ]; then
+		note "错误: 名称过长（最多 63 个字符）"
+		return 2
+	fi
 	if [ -n "$ip" ] && ! valid_ip4 "$ip"; then
 		note "错误: IPv4 地址格式不对"
 		return 2
@@ -224,6 +271,7 @@ cmd_bind() {
 }
 
 cmd_unbind() {
+	backup_cfg
 	mac=$(norm_mac "${1:-}")
 	if ! valid_mac "$mac"; then
 		note "错误: MAC 格式不对，应为 aa:bb:cc:dd:ee:ff"

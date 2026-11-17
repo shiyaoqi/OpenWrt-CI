@@ -1,0 +1,282 @@
+#!/bin/sh
+# =============================================================================
+# wb-dhcp — 实时查看 / 绑定 / 解绑 DHCPv4 静态地址分配
+# 设备: 京东云 AX1800 Pro (jdcloud,re-ss-01) / ImmortalWrt 25.12
+# 位置: /usr/bin/wb-dhcp（编进 squashfs，手动执行）
+#
+# 为什么实时生效
+#   dnsmasq 在启动(EVENT_INIT)与收到 SIGHUP(EVENT_RELOAD)时都会执行
+#     reread_dhcp(); lease_update_from_configs(); lease_update_file();
+#   即用 /etc/config/dhcp 里 config host 的 name 覆盖租约文件里旧的
+#   hostname，并写回 /tmp/dhcp.leases。因此改完配置重载 dnsmasq 后，
+#   LuCI「状态 → 网络 → DHCP 租约」刷新即可看到新名字，无需客户端重连。
+#   OpenWrt 的 /etc/init.d/dnsmasq restart 会重新生成配置并重启进程，
+#   走的就是上面的路径，比单纯 kill -HUP 更稳妥。
+#
+# 隐私约定（必须遵守）
+#   只显示/操作管理员自己写入 /etc/config/dhcp 的静态绑定条目，
+#   不扫描、不导出活动客户端明细；解绑清租约时按 MAC 过滤删除，
+#   不打印被删记录的任何字段。不写日志、不落盘任何客户端明细。
+#
+# 用法
+#   wb-dhcp list                         列出当前静态绑定（你配置的条目）
+#   wb-dhcp bind <MAC> <名字> [IP]       绑定/改名；IP 省略则只改名、不固定 IP
+#   wb-dhcp unbind <MAC>                 解绑并清理该 MAC 的租约记录
+#   wb-dhcp -n bind ...                  预览模式（改配置但不重载 dnsmasq）
+#   wb-dhcp -h
+#
+# 注意
+#   · 解绑只是取消静态绑定并让该设备从租约列表消失；IP 是否立刻可被
+#     重新分配仍由 dnsmasq 租约机制决定（不保证立即释放）。
+#   · 名称建议用英文/数字/连字符；dnsmasq 会把它当 hostname 用，
+#     含空格或中文可能影响 DNS 解析，但 DHCP 与 LuCI 显示不受影响。
+# =============================================================================
+set -eu
+
+DHCP_CFG="/etc/config/dhcp"
+LEASE4="/tmp/dhcp.leases"
+INIT_DNSMASQ="/etc/init.d/dnsmasq"
+TMP=""
+DRYRUN=0
+
+usage() {
+	cat <<'EOF'
+用法: wb-dhcp [-n] <命令> [参数]
+
+命令:
+  list                     列出当前静态绑定（仅显示你配置的条目）
+  bind <MAC> <名字> [IP]   绑定或改名；IP 省略则只改名、不固定 IP
+  unbind <MAC>             解除绑定，并清理该 MAC 的租约记录
+  -h                       显示本帮助
+
+选项:
+  -n    预览模式：改配置但不重载 dnsmasq（放在命令前，如 wb-dhcp -n bind ...）
+
+示例:
+  wb-dhcp list
+  wb-dhcp bind aa:bb:cc:dd:ee:ff living-room
+  wb-dhcp bind aa:bb:cc:dd:ee:ff printer 192.168.68.50
+  wb-dhcp unbind aa:bb:cc:dd:ee:ff
+
+说明:
+  · 改名/解绑后立即重载 dnsmasq，LuCI 刷新即可看到，无需设备重连。
+  · 只显示/操作管理员自己配置的静态绑定，不扫描活动客户端。
+  · 不输出被清理租约的任何主机名、MAC、IP 明细。
+EOF
+}
+
+cleanup() {
+	if [ -n "$TMP" ] && [ -f "$TMP" ]; then
+		rm -f "$TMP"
+	fi
+	TMP=""
+	return 0
+}
+trap cleanup EXIT INT TERM
+
+note() { printf '%s\n' "$*"; }
+
+# MAC 规范化：大写转小写、横杠转冒号
+norm_mac() {
+	printf '%s' "$1" | tr 'A-Z-' 'a-z:'
+}
+
+valid_mac() {
+	printf '%s' "$1" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'
+}
+
+valid_ip4() {
+	printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+# 列出 /etc/config/dhcp 中所有含 mac 选项的 host 段（完整 section id）
+host_sections() {
+	uci -q show dhcp 2>/dev/null | awk -F= '
+		/^dhcp\..*\.mac=/ { sub(/\.mac$/, "", $1); print $1 }
+	' | sort -u
+}
+
+section_macs() {
+	uci -q get "$1.mac" 2>/dev/null || true
+}
+
+# 找出包含指定 MAC 的所有 host 段
+find_sections_for_mac() {
+	target=$(norm_mac "$1")
+	for sec in $(host_sections); do
+		for m in $(section_macs "$sec"); do
+			if [ "$(norm_mac "$m")" = "$target" ]; then
+				printf '%s\n' "$sec"
+				break
+			fi
+		done
+	done
+}
+
+# 应用配置变更：commit + 重载 dnsmasq，使名字/绑定即时生效
+apply_changes() {
+	action="$1"
+	if ! uci -q commit dhcp; then
+		note "错误: uci commit dhcp 失败，配置未保存"
+		return 1
+	fi
+	if [ "$DRYRUN" -eq 1 ]; then
+		note "[预览] 已保存配置，但跳过 dnsmasq 重载"
+		return 0
+	fi
+	if [ -x "$INIT_DNSMASQ" ]; then
+		if "$INIT_DNSMASQ" restart >/dev/null 2>&1; then
+			note "已重载 dnsmasq，$action；LuCI 刷新即可看到"
+		else
+			note "警告: dnsmasq 重载失败，请手动执行 $INIT_DNSMASQ restart"
+			return 1
+		fi
+	else
+		note "警告: 未找到 $INIT_DNSMASQ，变更需重启路由器后生效"
+	fi
+	return 0
+}
+
+# 按 MAC 删除租约记录（不打印任何明细）
+prune_lease_mac() {
+	mac=$(norm_mac "$1")
+	if [ ! -f "$LEASE4" ]; then
+		note "租约记录: 文件不存在，跳过"
+		return 0
+	fi
+	removed=$(awk -v mac="$mac" '
+		tolower($2) == mac { n++ }
+		END { printf "%d", n + 0 }
+	' "$LEASE4")
+	if [ "$removed" -le 0 ]; then
+		note "租约记录: 无该设备记录"
+		return 0
+	fi
+	TMP=$(mktemp) || { note "租约记录: 无法创建临时文件"; return 1; }
+	awk -v mac="$mac" '
+		tolower($2) == mac { next }
+		{ print }
+	' "$LEASE4" > "$TMP"
+	if [ "$DRYRUN" -eq 0 ]; then
+		cat "$TMP" > "$LEASE4"
+		note "租约记录: 已清理 $removed 条"
+	else
+		note "租约记录: [预览] 将清理 $removed 条"
+	fi
+	return 0
+}
+
+cmd_list() {
+	total=0
+	for sec in $(host_sections); do
+		name=$(uci -q get "$sec.name" 2>/dev/null || printf '%s' '-')
+		ip=$(uci -q get "$sec.ip" 2>/dev/null || printf '%s' '-')
+		macs=$(section_macs "$sec")
+		note "  $name | MAC: $macs | IP: $ip"
+		total=$((total + 1))
+	done
+	note "共 $total 条静态绑定（仅显示你配置的条目）"
+}
+
+cmd_bind() {
+	mac=$(norm_mac "${1:-}")
+	name="${2:-}"
+	ip="${3:-}"
+	if ! valid_mac "$mac"; then
+		note "错误: MAC 格式不对，应为 aa:bb:cc:dd:ee:ff"
+		return 2
+	fi
+	if [ -z "$name" ]; then
+		note "错误: 缺少名称"
+		return 2
+	fi
+	case "$name" in
+		*\'*|*\"*) note "错误: 名称不能包含引号"; return 2 ;;
+	esac
+	case "$name" in
+		*'
+'*) note "错误: 名称不能包含换行"; return 2 ;;
+	esac
+	if [ -n "$ip" ] && ! valid_ip4 "$ip"; then
+		note "错误: IPv4 地址格式不对"
+		return 2
+	fi
+
+	secs=$(find_sections_for_mac "$mac")
+	if [ -n "$secs" ]; then
+		sec=$(printf '%s\n' "$secs" | head -n 1)
+		uci -q set "$sec.name=$name"
+		if [ -n "$ip" ]; then
+			uci -q set "$sec.ip=$ip"
+		fi
+		note "已更新静态绑定名称"$( [ -n "$ip" ] && printf '，并设置固定 IP' )
+	else
+		sid=$(uci -q add dhcp host)
+		sec="dhcp.$sid"
+		uci -q set "$sec.name=$name"
+		uci -q set "$sec.mac=$mac"
+		if [ -n "$ip" ]; then
+			uci -q set "$sec.ip=$ip"
+		fi
+		note "已新增静态绑定"$( [ -n "$ip" ] && printf '（固定 IP）' || printf '（仅改名，IP 仍动态）' )
+	fi
+	apply_changes "绑定已生效"
+}
+
+cmd_unbind() {
+	mac=$(norm_mac "${1:-}")
+	if ! valid_mac "$mac"; then
+		note "错误: MAC 格式不对，应为 aa:bb:cc:dd:ee:ff"
+		return 2
+	fi
+	secs=$(find_sections_for_mac "$mac")
+	if [ -z "$secs" ]; then
+		note "未找到该 MAC 的静态绑定，无需解绑"
+		return 0
+	fi
+	full_removes=0
+	partial_removes=0
+	for sec in $secs; do
+		mval=$(section_macs "$sec")
+		num=0
+		for m in $mval; do num=$((num + 1)); done
+		if [ "$num" -le 1 ]; then
+			uci -q delete "$sec"
+			full_removes=$((full_removes + 1))
+		else
+			newlist=""
+			for m in $mval; do
+				[ "$(norm_mac "$m")" = "$mac" ] && continue
+				newlist="$newlist $m"
+			done
+			uci -q set "$sec.mac=${newlist# }"
+			partial_removes=$((partial_removes + 1))
+		fi
+	done
+	prune_lease_mac "$mac"
+	summary="解绑已生效"
+	if [ "$full_removes" -gt 0 ]; then
+		summary="$summary（删除 $full_removes 条绑定"
+		if [ "$partial_removes" -gt 0 ]; then
+			summary="$summary，另有 $partial_removes 个多设备绑定段仅移除该 MAC"
+		fi
+		summary="$summary）"
+	elif [ "$partial_removes" -gt 0 ]; then
+		summary="$summary（从 $partial_removes 个多设备绑定段移除该 MAC，段保留）"
+	fi
+	apply_changes "$summary"
+}
+
+while [ "${1:-}" = "-n" ]; do
+	DRYRUN=1
+	shift
+done
+
+case "${1:-}" in
+	list) cmd_list ;;
+	bind) shift; cmd_bind "$@" ;;
+	unbind) shift; cmd_unbind "$@" ;;
+	-h|--help) usage ;;
+	*) usage; exit 2 ;;
+esac
+exit 0

@@ -1,0 +1,137 @@
+#!/bin/sh
+# WB 设备限速页的「仅局域网 / 仅走 IPv4」开关 → 防火墙规则同步
+#
+# 数据源：/etc/config/eqos 的 config device 段，每个设备最多生成一条规则：
+#   1) wan_block=1（仅局域网，优先级最高）
+#      src=lan  dest=wan  src_mac=<MAC，查不到时回退 src_ip>  target=DROP
+#      只挡「出网」，设备访问路由器与局域网内其它设备不受影响。
+#   2) v4only=1（仅走 IPv4）
+#      src=lan  dest=wan  family=ipv6  src_mac=<MAC>  target=DROP
+#      只阻断该设备的 IPv6 出网，客户端 Happy Eyeballs 自动回落 IPv4，
+#      于是 eqos 的 IPv4 限速就能覆盖它的全部实际流量。
+#      eqos 用 tc u32 match ip，只认 IPv4；IPv6 无法按地址限速（隐私地址轮换），
+#      所以这里不试图限速 IPv6，而是让设备干脆不用 IPv6。
+#
+# 幂等：每次运行先删掉所有 comment 以 WBEQ: 开头的旧规则，再按当前配置重建。
+# 边界：只动自己生成的规则，管理员手工建的 firewall 规则一律不读不删。
+# 隐私：comment 里只写管理员自己填的 IP，不写主机名，不在日志里留客户端明细。
+
+MARK='WBEQ:'
+FW=/etc/config/firewall
+
+[ -f "$FW" ] || exit 0
+[ -f /etc/config/eqos ] || exit 0
+
+. /lib/functions.sh
+
+# ---- 1. 清掉本脚本以前生成的规则 -------------------------------------------
+# 匿名 section 在 uci show 里显示为 @rule[N]，删除后索引会重排，
+# 所以每次只删第一个匹配项，循环到没有为止。
+REMOVED=0
+while :; do
+	sec=$(uci -q show firewall 2>/dev/null \
+		| sed -n "s/^firewall\.\(@[A-Za-z0-9_]*\[[0-9]*\]\)\.comment=['\"]WBEQ:.*/\1/p" \
+		| head -n 1)
+	[ -n "$sec" ] || break
+	uci -q delete "firewall.$sec"
+	REMOVED=1
+done
+
+# ---- 2. IP → MAC ------------------------------------------------------------
+# 优先读 DHCP 租约（无需遍历 UCI，不干扰上层的 config_foreach）
+lookup_mac() {
+	local ip="$1" mac n=0 hip
+
+	mac=$(awk -v ip="$ip" '$3 == ip { print $2; exit }' /tmp/dhcp.leases 2>/dev/null)
+	if [ -n "$mac" ]; then
+		echo "$mac"
+		return 0
+	fi
+
+	# 回退：静态绑定里找（临时开子 shell，避免污染当前 UCI 配置上下文）
+	mac=$(
+		. /lib/functions.sh
+		config_load dhcp 2>/dev/null
+		config_foreach _wb_match_host host "$ip"
+	)
+	echo "$mac"
+}
+
+_wb_match_host() {
+	local cfg="$1" want="$2" hip hmac
+
+	config_get hip "$cfg" 'ip'
+	[ "$hip" = "$want" ] || return 0
+	config_get hmac "$cfg" 'mac'
+	[ -n "$hmac" ] && echo "$hmac"
+}
+
+# ---- 3. 按 eqos 配置重建 ----------------------------------------------------
+ADDED=0
+
+handle_dev() {
+	local cfg="$1" block v4only ip mac sec
+
+	config_get ip "$cfg" 'ip'
+	[ -n "$ip" ] || return 0
+
+	config_get_bool block "$cfg" 'wan_block' 0
+	config_get_bool v4only "$cfg" 'v4only' 0
+
+	# ---- 仅局域网：整机断外网，优先级最高，不必再单独生成 IPv6 规则 ----
+	if [ "$block" -eq 1 ]; then
+		sec=$(uci -q add firewall rule) || return 0
+		uci -q set "firewall.$sec.name"="WB仅局域网-$ip"
+		uci -q set "firewall.$sec.src"='lan'
+		uci -q set "firewall.$sec.dest"='wan'
+		uci -q set "firewall.$sec.proto"='all'
+		uci -q set "firewall.$sec.target"='DROP'
+		uci -q set "firewall.$sec.enabled"='1'
+		uci -q set "firewall.$sec.comment"="$MARK$ip"
+
+		mac=$(lookup_mac "$ip")
+		if [ -n "$mac" ]; then
+			# 按 MAC 匹配：设备换了 IP 规则依然有效，且 IPv4/IPv6 一并拦下
+			uci -q set "firewall.$sec.src_mac"="$mac"
+		else
+			# 查不到 MAC 时回退到源 IP（只覆盖 IPv4）
+			uci -q set "firewall.$sec.src_ip"="$ip"
+		fi
+
+		ADDED=$((ADDED + 1))
+		return 0
+	fi
+
+	# ---- 仅走 IPv4：只阻断 IPv6 出网，让流量落到 eqos 能管的 IPv4 上 ----
+	[ "$v4only" -eq 1 ] || return 0
+
+	mac=$(lookup_mac "$ip")
+	# IPv6 规则的 src_ip 填 IPv4 地址毫无意义，必须按 MAC 定位设备；
+	# 查不到 MAC 时宁可不生成，也不留一条永不命中的空规则。
+	[ -n "$mac" ] || return 0
+
+	sec=$(uci -q add firewall rule) || return 0
+	uci -q set "firewall.$sec.name"="WB仅IPv4-$ip"
+	uci -q set "firewall.$sec.src"='lan'
+	uci -q set "firewall.$sec.dest"='wan'
+	uci -q set "firewall.$sec.family"='ipv6'
+	uci -q set "firewall.$sec.proto"='all'
+	uci -q set "firewall.$sec.src_mac"="$mac"
+	uci -q set "firewall.$sec.target"='DROP'
+	uci -q set "firewall.$sec.enabled"='1'
+	uci -q set "firewall.$sec.comment"="$MARK$ip:v6"
+
+	ADDED=$((ADDED + 1))
+}
+
+config_load eqos
+config_foreach handle_dev device
+uci -q commit firewall
+
+# ---- 4. 重载防火墙 ----------------------------------------------------------
+# 规则没有变化时不动防火墙，避免无谓断流
+if [ "$ADDED" -gt 0 ] || [ "$REMOVED" -eq 1 ]; then
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+fi
+
+exit 0

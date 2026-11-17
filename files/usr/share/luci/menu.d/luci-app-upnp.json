@@ -1,0 +1,14 @@
+{
+	"admin/network/upnp": {
+		"title": "自动端口映射",
+		"order": 27,
+		"action": {
+			"type": "view",
+			"path": "upnp/upnp"
+		},
+		"depends": {
+			"acl": [ "luci-app-upnp" ],
+			"uci": { "upnpd": true }
+		}
+	}
+}

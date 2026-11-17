@@ -1,0 +1,21 @@
+{
+	"luci-app-wbnlbw": {
+		"description": "允许带宽统计页面顶部的开启/关闭按钮运行 wb-nlbw",
+		"read": {
+			"ubus": {
+				"file": [ "exec", "stat" ]
+			},
+			"file": {
+				"/usr/bin/wb-nlbw*": [ "exec" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"file": {
+				"/usr/bin/wb-nlbw*": [ "exec" ]
+			}
+		}
+	}
+}

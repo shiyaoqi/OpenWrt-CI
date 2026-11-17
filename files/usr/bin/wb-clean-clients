@@ -1,0 +1,210 @@
+#!/bin/sh
+# =============================================================================
+# wb-clean-clients — 手动清理 LuCI「DHCP 租约 / 客户端列表」里的离线残留
+# 设备: 京东云 AX1800 Pro (jdcloud,re-ss-01) / ImmortalWrt 25.12
+# 位置: /usr/bin/wb-clean-clients（编进 squashfs，手动执行）
+#
+# 判定规则
+#   1. 已过期租约（到期时间 <= 当前时间）：直接清理，这是原来的行为。
+#   2. 加 -a 后，未到期或永不过期的租约也会按「离线」判定后清理：
+#      - 邻居表里该 IP+MAC 的状态为 REACHABLE / DELAY / PROBE → 在线，保留；
+#      - 无线关联表（iw station dump）里出现该 MAC → 在线，保留；
+#      - 以上都没有时再 ping 一次，能通则保留，否则视为离线。
+#      STALE / FAILED / INCOMPLETE 不视为在线证据。
+#
+# 隐私约定（必须遵守）
+#   不采集、不输出、不保存任何客户端的主机名 / MAC / IP 明细；
+#   只打印计数（删除了几条、剩几条）。临时文件用完即删。
+#
+# 用法
+#   wb-clean-clients              # 清理过期租约
+#   wb-clean-clients -a           # 同时清理未到期但已离线的租约（推荐）
+#   wb-clean-clients -n           # 预览，不改文件
+#   wb-clean-clients -f           # 连同 IPv6 租约的过期项一起清理
+#   wb-clean-clients -h           # 帮助
+# =============================================================================
+set -eu
+
+LEASE4="${WB_LEASE4:-/tmp/dhcp.leases}"
+LEASE6="${WB_LEASE6:-/tmp/odhcpd.leases}"
+IP_BIN="${WB_IP_BIN:-/sbin/ip}"
+PING_BIN="${WB_PING_BIN:-/bin/ping}"
+IW_BIN="${WB_IW_BIN:-/usr/sbin/iw}"
+
+DRYRUN=0
+FORCE6=0
+ALL_OFFLINE=0
+TEMPS=""
+
+usage() {
+	cat <<'EOF'
+用法: wb-clean-clients [选项]
+
+清理 LuCI 客户端列表里已离线、但仍显示的 DHCP 租约记录。
+
+选项:
+  -n    预览模式：只报告会清理多少条，不改动任何文件
+  -a    同时清理「未到期但已离线」的租约（按邻居表/无线关联/一次 ping 判定）
+  -f    同时处理 /tmp/odhcpd.leases 中的过期 IPv6 项（默认不动 IPv6）
+  -h    显示本帮助
+
+说明:
+  · 过期租约始终会被清理；时间戳 0（永不过期）的行只在加 -a 且判定离线时才清理。
+  · -a 下，邻居状态 REACHABLE/DELAY/PROBE、无线已关联、或 ping 能通的设备会保留。
+  · 不输出任何主机名、MAC、IP 地址，只输出条数。
+  · 不影响静态 DHCP 分配（UCI dhcp.@host）与 DNS 服务。
+EOF
+}
+
+cleanup() {
+	for f in $TEMPS; do
+		[ -f "$f" ] && rm -f "$f"
+	done
+	TEMPS=""
+	return 0
+}
+trap cleanup EXIT INT TERM
+
+note() { printf '%s\n' "$*"; }
+
+while getopts "nafh" opt; do
+	case "$opt" in
+		n) DRYRUN=1 ;;
+		a) ALL_OFFLINE=1 ;;
+		f) FORCE6=1 ;;
+		h) usage; exit 0 ;;
+		*) usage; exit 2 ;;
+	esac
+done
+
+# --- 在线状态判定所需的两份快照 ----------------------------------------------
+NEIGH_FILE=$(mktemp); TEMPS="$TEMPS $NEIGH_FILE"; : > "$NEIGH_FILE"
+STA_FILE=$(mktemp);   TEMPS="$TEMPS $STA_FILE";   : > "$STA_FILE"
+
+if [ -x "$IP_BIN" ]; then
+	"$IP_BIN" -4 neigh show >> "$NEIGH_FILE" 2>/dev/null || :
+fi
+if [ -x "$IW_BIN" ]; then
+	for iface in $("$IW_BIN" dev 2>/dev/null | awk '$1 == "Interface" { print $2 }'); do
+		"$IW_BIN" dev "$iface" station dump 2>/dev/null >> "$STA_FILE" || :
+	done
+fi
+
+is_online() {
+	io_mac=$(printf '%s' "$1" | tr 'A-F' 'a-f' | tr '-' ':')
+	io_ip="$2"
+
+	if [ -s "$NEIGH_FILE" ] && [ -n "$io_ip" ]; then
+		awk -v ip="$io_ip" -v mac="$io_mac" '
+			$1 == ip && tolower($0) ~ mac &&
+			($NF == "REACHABLE" || $NF == "DELAY" || $NF == "PROBE") {
+				found = 1; exit
+			}
+			END { exit !found }
+		' "$NEIGH_FILE" && return 0
+	fi
+
+	if [ -s "$STA_FILE" ] && grep -qi "^Station $io_mac" "$STA_FILE"; then
+		return 0
+	fi
+
+	if [ -n "$io_ip" ] && [ -x "$PING_BIN" ]; then
+		"$PING_BIN" -c 1 -W 1 -q "$io_ip" >/dev/null 2>&1 && return 0
+	fi
+
+	return 1
+}
+
+# --- 清理租约文件 -------------------------------------------------------------
+# clf_useall=1 时才判定「未到期但离线」；IPv6 文件固定传 0。
+clean_lease_file() {
+	clf_file="$1"
+	clf_label="$2"
+	clf_useall="$3"
+
+	if [ ! -f "$clf_file" ]; then
+		note "$clf_label: 文件不存在，跳过"
+		return 0
+	fi
+
+	clf_now=$(date +%s)
+	CLF_TMP=$(mktemp);   TEMPS="$TEMPS $CLF_TMP"
+	CLF_KEYS=$(mktemp);  TEMPS="$TEMPS $CLF_KEYS";  : > "$CLF_KEYS"
+	CLF_CAND=$(mktemp);  TEMPS="$TEMPS $CLF_CAND";  : > "$CLF_CAND"
+	CLF_COUNT=$(mktemp); TEMPS="$TEMPS $CLF_COUNT"; : > "$CLF_COUNT"
+
+	if [ "$clf_useall" = "1" ]; then
+		# 候选 = 未到期或永不过期的行；逐条判定是否离线。
+		awk -v now="$clf_now" '
+			$1 ~ /^[0-9]+$/ && ($1 + 0 == 0 || $1 + 0 > now) && NF >= 3 {
+				print $2, $3
+			}
+		' "$clf_file" > "$CLF_CAND"
+
+		while read -r clf_mac clf_ip; do
+			[ -n "$clf_mac" ] || continue
+			if ! is_online "$clf_mac" "$clf_ip"; then
+				printf '%s %s\n' "$clf_mac" "$clf_ip" >> "$CLF_KEYS"
+			fi
+		done < "$CLF_CAND"
+	fi
+
+	awk -v now="$clf_now" -v keys="$CLF_KEYS" -v countfile="$CLF_COUNT" -v useall="$clf_useall" '
+		BEGIN {
+			if (useall == "1") {
+				while ((getline line < keys) > 0) {
+					if (split(line, a, " ") >= 2)
+						drop[tolower(a[1]) " " a[2]] = 1
+				}
+				close(keys)
+			}
+		}
+		{
+			ts = $1
+			expired = (ts ~ /^[0-9]+$/ && ts + 0 > 0 && ts + 0 <= now)
+			key = tolower($2) " " $3
+			offline = (useall == "1" && (key in drop))
+			if (expired || offline) {
+				removed++; if (expired) ex++; else if (offline) off++
+				next
+			}
+			print
+		}
+		END {
+			printf "%d %d %d\n", removed + 0, ex + 0, off + 0 > countfile
+		}
+	' "$clf_file" > "$CLF_TMP"
+
+	read -r clf_removed clf_expired clf_offline < "$CLF_COUNT"
+	clf_after=$(wc -l < "$CLF_TMP")
+
+	if [ "${clf_removed:-0}" -le 0 ]; then
+		note "$clf_label: 无需清理（共 $clf_after 条，过期 0，离线 0）"
+		return 0
+	fi
+
+	if [ "$DRYRUN" -eq 1 ]; then
+		note "$clf_label: [预览] 将清理 $clf_removed 条（过期 $clf_expired，离线 $clf_offline），保留 $clf_after 条（未改动文件）"
+		return 0
+	fi
+
+	# 原地覆盖，保持 inode 与权限；不发 SIGHUP（dnsmasq 不会重读 lease 文件）。
+	cat "$CLF_TMP" > "$clf_file"
+	note "$clf_label: 已清理 $clf_removed 条（过期 $clf_expired，离线 $clf_offline），保留 $clf_after 条"
+}
+
+clean_lease_file "$LEASE4" "IPv4 租约" "$ALL_OFFLINE"
+
+if [ "$FORCE6" -eq 1 ]; then
+	# IPv6 租约格式不同，这里只按过期时间清理，不做 MAC 离线判定。
+	clean_lease_file "$LEASE6" "IPv6 租约" 0
+else
+	note "IPv6 租约: 未处理（需要时加 -f）"
+fi
+
+if [ "$DRYRUN" -eq 1 ]; then
+	note "完成（预览模式，未改动任何文件）"
+else
+	note "完成。刷新 LuCI「状态 → 网络 → 客户端」后即可看到离线项已消失。"
+fi
+exit 0

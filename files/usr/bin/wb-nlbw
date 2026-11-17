@@ -1,0 +1,51 @@
+#!/bin/sh
+# WB 带宽统计（nlbwmon）开关
+#   status  输出 running / stopped
+#   on      开机自启 + 立即启动（同时打开内核 conntrack 字节计数）
+#   off     停止 + 取消自启（同时关掉 conntrack 字节计数，做到真正零开销）
+# 只操作 nlbwmon 服务与内核 acct 开关；不改数据库、不删历史文件。
+# 注意：数据库在 /var/lib/nlbwmon（tmpfs，占内存），关闭服务后不再写入。
+
+INIT=/etc/init.d/nlbwmon
+
+# nlbwmon 靠内核对每条连接维护的字节/包计数器来统计。
+# 上游 init 脚本不设置这个 sysctl，由 nlbwmon 启动时自行打开；
+# 但停掉服务后它不会关回去 —— 计数器就变成纯开销，这里负责收尾。
+ACCT=/proc/sys/net/netfilter/nf_conntrack_acct
+
+set_acct() {
+	[ -w "$ACCT" ] || return 0
+	printf '%s\n' "$1" > "$ACCT" 2>/dev/null || true
+}
+
+case "$1" in
+	status)
+		if [ -x "$INIT" ] && "$INIT" running >/dev/null 2>&1; then
+			echo running
+		else
+			echo stopped
+		fi
+		;;
+	on)
+		[ -x "$INIT" ] || { echo "nlbwmon 未安装" >&2; exit 1; }
+		# 先开计数再启动服务，避免启动瞬间的流量漏计
+		set_acct 1
+		"$INIT" enable >/dev/null 2>&1
+		"$INIT" start >/dev/null 2>&1
+		echo running
+		;;
+	off)
+		if [ -x "$INIT" ]; then
+			"$INIT" stop >/dev/null 2>&1
+			"$INIT" disable >/dev/null 2>&1
+		fi
+		set_acct 0
+		echo stopped
+		;;
+	*)
+		echo "用法: wb-nlbw status|on|off" >&2
+		exit 1
+		;;
+esac
+
+exit 0

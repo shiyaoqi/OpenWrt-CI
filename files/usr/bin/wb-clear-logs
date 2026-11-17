@@ -1,0 +1,38 @@
+#!/bin/sh
+# =============================================================================
+# wb-clear-logs - LuCI 日志页「清空日志」按钮后端
+# 设备设定: 京东云 AX1800 Pro / ImmortalWrt 25.12
+# 作者约定: 只做清空，不读、不打印、不落盘任何日志正文。
+# =============================================================================
+set -eu
+
+mode="${1:-}"
+
+case "$mode" in
+	system|sys|logread)
+		# 系统日志页读的是 logd 缓冲；logread -c 清空该缓冲。
+		# 某些固件 logread 不支持 -c，此时静默跳过，避免按钮报错。
+		if command -v logread >/dev/null 2>&1; then
+			logread -c >/dev/null 2>&1 || true
+		fi
+		echo '系统日志已清空'
+		;;
+
+	kernel|kern|dmesg)
+		# 内核日志页读的是内核 ring buffer；dmesg -c/-C 清空它。
+		# BusyBox 与 util-linux 参数不同，两种都试。
+		if [ -x /bin/dmesg ]; then
+			/bin/dmesg -c >/dev/null 2>&1 || /bin/dmesg -C >/dev/null 2>&1 || true
+		elif command -v dmesg >/dev/null 2>&1; then
+			dmesg -c >/dev/null 2>&1 || dmesg -C >/dev/null 2>&1 || true
+		fi
+		echo '内核日志已清空'
+		;;
+
+	*)
+		echo "用法: $0 <system|kernel>" >&2
+		exit 2
+		;;
+esac
+
+exit 0

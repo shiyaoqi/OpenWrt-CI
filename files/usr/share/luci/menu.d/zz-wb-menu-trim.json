@@ -1,0 +1,9 @@
+{
+	"admin/status/nftables": {
+		"depends": {
+			"fs": {
+				"/etc/wb-hide-status-firewall": "file"
+			}
+		}
+	}
+}
